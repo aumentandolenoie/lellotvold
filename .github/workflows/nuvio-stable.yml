@@ -1,0 +1,133 @@
+name: Nuvio Stable native webOS preview
+on:
+  push:
+    branches: [nuvio-stable]
+    paths:
+      - '.github/workflows/nuvio-stable.yml'
+      - 'scripts/**'
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nuvio-stable-native-preview
+  cancel-in-progress: false
+
+jobs:
+  native-ipk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Fetch release recipes
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch only the original pinned Nuvio Native Legacy repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init native
+          git -C native remote add origin https://github.com/iqui27/nuvio-native-legacy.git
+          git -C native fetch --depth 1 origin e3e21a590120ca283bcf7a96df1813ff5041eb66
+          git -C native checkout --detach FETCH_HEAD
+          test "$(git -C native rev-parse HEAD)" = e3e21a590120ca283bcf7a96df1813ff5041eb66
+
+      - name: Apply Stable native identity and episode safeguards
+        run: |
+          set -euo pipefail
+          python3 scripts/patch_native.py native
+          python3 - <<'PY'
+          import pathlib,json
+          root=pathlib.Path("native")
+          app=json.loads((root/"deploy/app/appinfo.json").read_text())
+          assert app["id"]=="space.nuvio.stable" and app["type"]=="native"
+          assert "explicitSeries" in (root/"src/syncprog.c").read_text()
+          assert (root/"src/video.c").exists() and (root/"src/epg.c").exists()
+          PY
+
+      - name: Install build packages and webOS CLI
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libgles2-mesa-dev \
+            libegl1-mesa-dev zlib1g-dev binutils
+          npm install --global @webos-tools/cli@3.2.6
+          command -v ares-package
+
+      - name: Build original webOS native cross-toolchain
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 \
+            --build-arg SDK_URL=https://github.com/openlgtv/buildroot-nc4/releases/download/webos-a38c582/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz \
+            -t nuvio-webos-sdk native/tools/
+
+      - name: Generate public-only Nuvio login settings
+        run: |
+          set -euo pipefail
+          cat >native/local.properties <<'CFG'
+          NUVIO_SUPABASE_URL=https://api.nuvio.tv
+          TV_LOGIN_WEB_BASE_URL=https://nuvio.tv/tv-login
+          SIMKL_APP_NAME=nuvio
+          CFG
+          SOURCE=https://raw.githubusercontent.com/NuvioMedia/self-host/main/.env.example
+          KEY="$(curl -fsSL --retry 3 "$SOURCE" | sed -n 's/^NUVIO_CLOUD_PUBLISHABLE_KEY=//p' | head -1 | tr -d '\r')"
+          test -n "$KEY"
+          printf 'NUVIO_SUPABASE_ANON_KEY=%s\n' "$KEY" >>native/local.properties
+          chmod 600 native/local.properties
+          (cd native && bash tools/env.sh --require-core >/dev/null)
+
+      - name: Cross-compile native application and package IPK
+        env:
+          NUVIO_CONTAINER_RUNTIME: docker
+          NUVIO_BUILD_PLATFORM: linux/amd64
+          NUVIO_P2P_MOTOR: none
+          NUVIO_SDK_IMAGE: nuvio-webos-sdk
+          NUVIO_DTS_FFMPEG: '1'
+        run: |
+          set -euo pipefail
+          export NUVIO_ARES_PACKAGE="$(command -v ares-package)"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          export NUVIO_RELEASE_OUT="$GITHUB_WORKSPACE/out"
+          (cd native && bash tools/arm.sh --ipk --build) 2>&1 | tee build.log
+          test "$(find out -maxdepth 1 -name '*.ipk' | wc -l)" -eq 1
+
+      - name: Verify IPK and generate Homebrew Channel repository
+        run: |
+          set -euo pipefail
+          IPK="$(find out -maxdepth 1 -type f -name '*.ipk' -print -quit)"
+          python3 scripts/make_homebrew.py "$IPK" "$GITHUB_REPOSITORY" nuvio-stable-beta out
+          python3 -m json.tool out/repo.json >/dev/null
+          python3 -m json.tool out/webosbrew.manifest.json >/dev/null
+
+      - name: Preserve build and Homebrew assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuvio-stable-native-ipk
+          path: out/
+          retention-days: 30
+
+      - name: Publish tested native beta to stable Homebrew URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=nuvio-stable-beta
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Nuvio Stable native webOS preview" \
+              --notes "Beta tecnica nativa: interfaccia Nuvio ufficiale non ancora ricostruita. Test solo dopo installazione su LG webOS." --prerelease
+          fi
+          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Homebrew Channel repository: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/repo.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Store compilation log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuvio-stable-native-build-log
+          path: build.log
+          if-no-files-found: ignore
